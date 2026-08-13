@@ -1,5 +1,4 @@
-# Channel 2 and Channel 3 Object Analysis
-
+# 3D TIFF image Channel thresholding.
 This script measures fixed-threshold 3D objects in channel 2, channel 3, or both channels of every TIFF image in a selected folder.
 
 ## Analysis workflow
