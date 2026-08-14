@@ -19,7 +19,7 @@ For each selected channel in every image, the script:
 6. Saves the filled and size-filtered binary mask.
 7. Records the retained object count and each object's filled volume.
 
-C2 and C3 use independent lower and upper size limits. The script contains no Otsu or MIP threshold calculation, intensity filter, or composite generation.
+C2 and C3 use independent lower and upper size limits.
 
 ## Installation
 
