@@ -27,13 +27,19 @@ from skimage import feature, filters, measure, morphology, segmentation
 
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
+OUTPUT_DIRECTORY_NAMES = {
+    "intensity", "projections", "masks", "rois", "channel_analysis_results",
+    "condensate_thresholding", "colocalization_analysis",
+}
 LOG = logging.getLogger("nucleus_intensity")
 
 
 @dataclass(frozen=True)
 class Settings:
+    segmentation_channel: int = 1
     min_nucleus_area_px: int = 5000
     gaussian_sigma_px: float = 1.0
+    fill_holes: bool = True
     clear_border: bool = False
     split_touching_nuclei: bool = True
     watershed_min_distance_px: int = 65
@@ -50,7 +56,7 @@ class ProjectionInfo:
 
 
 TARGET_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*)\s*-?\s*(488|568)(?!\d)", re.IGNORECASE)
-TARGET_NAME_CORRECTIONS = {"nop61": "NOP16"}
+TARGET_NAME_CORRECTIONS: dict[str, str] = {}
 
 
 def _target_pairs(text: str) -> list[tuple[str, int]]:
@@ -83,24 +89,29 @@ def infer_target_names(input_folder: Path, channel_count: int) -> dict[int, str]
             unique_names = list(dict.fromkeys(name for name, _ in pairs))
             if len(unique_names) == 1:
                 return {2: unique_names[0]}
-        raise ValueError(
-            "Could not infer the single channel-2 target from condition/marker folders: "
-            + " | ".join(source_names)
-        )
+        return {2: "ch2"}
 
     for pairs in candidates:
         by_wavelength = {wavelength: name for name, wavelength in pairs}
         if 488 in by_wavelength and 568 in by_wavelength:
             return {2: by_wavelength[488], 3: by_wavelength[568]}
-    raise ValueError(
-        "Could not infer both 488/ch2 and 568/ch3 targets from condition/marker folders: "
-        + " | ".join(source_names)
-    )
+    return {2: "ch2", 3: "ch3"}
 
 
 def _target_column_prefix(target_name: str) -> str:
     prefix = re.sub(r"[^A-Za-z0-9]+", "_", target_name).strip("_")
     return prefix or "target"
+
+
+def infer_condition(path: Path) -> str:
+    """Infer a condition label from the closest matching ancestor."""
+    for part in reversed(path.parts):
+        text = part.casefold()
+        if "normoxia" in text:
+            return "normoxia"
+        if "hypoxia" in text:
+            return "hypoxia"
+    return "unspecified"
 
 
 def _normalize_axes(array: np.ndarray, axes: str) -> tuple[np.ndarray, list[str]]:
@@ -223,7 +234,8 @@ def segment_nuclei(dapi_projection: np.ndarray, settings: Settings) -> tuple[np.
     threshold = float(filters.threshold_otsu(smoothed[np.isfinite(smoothed)]))
     binary = smoothed > threshold
     # Match the microscopy "Fill Holes" operation before extracting ROIs.
-    binary = ndi.binary_fill_holes(binary)
+    if settings.fill_holes:
+        binary = ndi.binary_fill_holes(binary)
     # Remove isolated DAPI foci/noise using a user-configurable pixel-area filter.
     binary = morphology.remove_small_objects(binary, min_size=settings.min_nucleus_area_px)
     binary = morphology.binary_closing(binary, morphology.disk(1))
@@ -270,9 +282,14 @@ def measure_nuclei(
     projections: np.ndarray,
     image_name: str,
     target_names: dict[int, str] | None = None,
+    segmentation_channel: int = 1,
 ) -> list[dict]:
     """Return one flat, machine-readable record per nucleus."""
-    dapi = projections[0]
+    if not 1 <= segmentation_channel <= projections.shape[0]:
+        raise ValueError(
+            f"Segmentation channel {segmentation_channel} is outside 1..{projections.shape[0]}"
+        )
+    dapi = projections[segmentation_channel - 1]
     props = measure.regionprops(labels, intensity_image=dapi)
     rows: list[dict] = []
     for prop in props:
@@ -292,7 +309,9 @@ def measure_nuclei(
             "dapi_mean_intensity": float(np.mean(dapi[nucleus_slice][nucleus_mask])),
             "dapi_integrated_intensity": float(np.sum(dapi[nucleus_slice][nucleus_mask], dtype=np.float64)),
         }
-        for channel_index in range(1, projections.shape[0]):
+        for channel_index in range(projections.shape[0]):
+            if channel_index == segmentation_channel - 1:
+                continue
             values = projections[channel_index][nucleus_slice][nucleus_mask]
             channel_number = channel_index + 1
             target = (target_names or {}).get(channel_number, f"ch{channel_number}")
@@ -395,7 +414,8 @@ def write_excel(
     measured_columns = list(dict.fromkeys(key for row in nucleus_rows for key in row))
     nuclei_columns = base_nuclei_columns + [key for key in measured_columns if key not in base_nuclei_columns]
     image_columns = [
-        "image", "condition", "channel_2_target", "channel_3_target", "source_axes", "source_shape",
+        "image", "condition", "segmentation_channel", "channel_2_target", "channel_3_target",
+        "source_axes", "source_shape",
         "channel_count", "z_slices", "otsu_threshold",
         "nucleus_count", "projection_file", "binary_mask_file", "label_mask_file", "roi_boundary_file",
     ]
@@ -404,8 +424,10 @@ def write_excel(
         for (key, value), description in zip(
             asdict(settings).items(),
             [
+                "One-based channel used to segment nuclei or other primary objects.",
                 "Remove connected DAPI objects smaller than this area.",
                 "Gaussian smoothing before global Otsu thresholding.",
+                "Fill internal holes in the thresholded segmentation mask.",
                 "Exclude nuclei touching an image border.",
                 "Separate touching DAPI nuclei with marker-controlled watershed.",
                 "Minimum distance between watershed nuclear-center markers.",
@@ -426,6 +448,7 @@ def analyze_folder(
     input_folder: Path,
     settings: Settings | None = None,
     progress: Callable[[str], None] | None = None,
+    channel_names: dict[int, str] | None = None,
 ) -> Path:
     settings = settings or Settings()
     input_folder = Path(input_folder).resolve()
@@ -448,16 +471,27 @@ def analyze_folder(
             progress(message)
         try:
             info = load_sum_projections(path)
+            if not 1 <= settings.segmentation_channel <= info.channel_count:
+                raise ValueError(
+                    f"--segmentation-channel must be within 1..{info.channel_count} for {path.name}"
+                )
             target_names = infer_target_names(input_folder, info.channel_count)
-            labels, threshold = segment_nuclei(info.projections[0], settings)
-            measurements = measure_nuclei(labels, info.projections, path.name, target_names)
+            target_names.update(channel_names or {})
+            labels, threshold = segment_nuclei(
+                info.projections[settings.segmentation_channel - 1], settings
+            )
+            measurements = measure_nuclei(
+                labels, info.projections, path.name, target_names,
+                settings.segmentation_channel,
+            )
             rois = _boundary_vertices(labels, path.name)
             output_files = _save_outputs(output_dir, path.stem, info.projections, labels, rois)
             nucleus_rows.extend(measurements)
             image_rows.append(
                 {
                     "image": path.name,
-                    "condition": "hypoxia" if "hypoxia" in input_folder.parent.name.casefold() else "normoxia",
+                    "condition": infer_condition(input_folder),
+                    "segmentation_channel": settings.segmentation_channel,
                     "channel_2_target": target_names.get(2),
                     "channel_3_target": target_names.get(3),
                     "source_axes": info.source_axes,
@@ -479,11 +513,36 @@ def analyze_folder(
     return workbook
 
 
-def find_analysis_folders(batch_root: Path) -> list[Path]:
+def find_analysis_folders(batch_root: Path, folder_name: str | None = None) -> list[Path]:
+    """Find leaf-most directories containing TIFF files, regardless of folder name.
+
+    ``folder_name`` can optionally restrict recursive discovery to a chosen
+    directory name. Known output directories are always ignored.
+    """
+    root = Path(batch_root).resolve()
+    candidates = [root, *(path for path in root.rglob("*") if path.is_dir())]
+    direct_tiff_folders: list[Path] = []
+    for path in candidates:
+        try:
+            relative_parts = path.relative_to(root).parts
+        except ValueError:
+            continue
+        if any(part.casefold() in OUTPUT_DIRECTORY_NAMES for part in relative_parts):
+            continue
+        if folder_name and path.name.casefold() != folder_name.casefold():
+            continue
+        if any(
+            item.is_file() and item.suffix.casefold() in TIFF_SUFFIXES
+            for item in path.iterdir()
+        ):
+            direct_tiff_folders.append(path.resolve())
+    if folder_name:
+        return sorted(set(direct_tiff_folders))
+    # If both a parent and its descendant contain TIFFs, default to the deeper
+    # folder to avoid processing duplicated exports in nested layouts.
     return sorted(
-        path.resolve()
-        for path in Path(batch_root).resolve().rglob("*")
-        if path.is_dir() and path.name.casefold() == "new folder"
+        path for path in set(direct_tiff_folders)
+        if not any(path != other and path in other.parents for other in direct_tiff_folders)
     )
 
 
@@ -499,18 +558,18 @@ def _source_snapshot(batch_root: Path) -> dict[str, tuple[int, int]]:
 def write_batch_count_qa(
     batch_root: Path,
     summary: list[dict],
-    expected_count: int = 25,
+    expected_count: int | None = None,
     exempt_dates: set[str] | None = None,
 ) -> Path:
     """Write target-by-treatment nucleus-count QA without changing any ROIs."""
-    exempt_dates = exempt_dates or {"20260717"}
+    exempt_dates = exempt_dates or set()
     records: list[dict] = []
     for item in summary:
         if item["status"] != "complete":
             continue
         workbook_path = Path(item["workbook"])
         images = pd.read_excel(workbook_path, sheet_name="Images")
-        date_match = re.search(r"(?:^|[\\/])(\d{8})\s+MCF10A", str(workbook_path), re.IGNORECASE)
+        date_match = re.search(r"(?<!\d)(\d{8})(?!\d)", str(workbook_path))
         date = date_match.group(1) if date_match else "unknown"
         for row in images.itertuples(index=False):
             targets = [
@@ -538,11 +597,14 @@ def write_batch_count_qa(
             .sort_values(["target_group", "date", "condition"])
         )
         qa["expected_count"] = expected_count
-        qa["qa_status"] = np.where(
-            qa["date"].isin(exempt_dates),
-            "EXEMPT_DATE",
-            np.where(qa["nucleus_count"] == expected_count, "PASS", "REVIEW"),
-        )
+        if expected_count is None:
+            qa["qa_status"] = "NOT_CONFIGURED"
+        else:
+            qa["qa_status"] = np.where(
+                qa["date"].isin(exempt_dates),
+                "EXEMPT_DATE",
+                np.where(qa["nucleus_count"] == expected_count, "PASS", "REVIEW"),
+            )
     output_path = Path(batch_root).resolve() / "nuclear_intensity_count_QA.csv"
     qa.to_csv(output_path, index=False)
     return output_path
@@ -553,11 +615,16 @@ def analyze_batch(
     settings: Settings | None = None,
     progress: Callable[[str], None] | None = None,
     excluded_targets: set[str] | None = None,
+    folder_name: str | None = None,
+    channel_names: dict[int, str] | None = None,
+    expected_count: int | None = None,
+    qa_exempt_dates: set[str] | None = None,
 ) -> list[dict]:
     settings = settings or Settings()
-    folders = find_analysis_folders(batch_root)
+    folders = find_analysis_folders(batch_root, folder_name)
     if not folders:
-        raise FileNotFoundError(f"No TIFF-containing folder named 'New folder' found under {batch_root}")
+        suffix = f" named {folder_name!r}" if folder_name else ""
+        raise FileNotFoundError(f"No TIFF-containing input folder{suffix} found under {batch_root}")
     source_before = _source_snapshot(batch_root)
     summary: list[dict] = []
     exclusions = {name.casefold() for name in (excluded_targets or set())}
@@ -575,7 +642,7 @@ def analyze_batch(
             )
             continue
         try:
-            workbook = analyze_folder(folder, settings, progress)
+            workbook = analyze_folder(folder, settings, progress, channel_names)
             summary.append({"folder": str(folder), "status": "complete", "workbook": str(workbook), "error": ""})
         except Exception as exc:
             LOG.exception("Dataset failed: %s", folder)
@@ -584,7 +651,7 @@ def analyze_batch(
             )
     summary_path = Path(batch_root).resolve() / "nuclear_intensity_batch_summary.csv"
     pd.DataFrame(summary).to_csv(summary_path, index=False)
-    qa_path = write_batch_count_qa(batch_root, summary)
+    qa_path = write_batch_count_qa(batch_root, summary, expected_count, qa_exempt_dates)
     qa_frame = pd.read_csv(qa_path)
     review_count = int((qa_frame["qa_status"] == "REVIEW").sum()) if not qa_frame.empty else 0
     if review_count:
@@ -660,15 +727,31 @@ def _show_message(title: str, message: str, error: bool = False) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-folder", type=Path, help="Skip the folder picker and analyze this folder.")
-    parser.add_argument("--batch-root", type=Path, help="Process every TIFF-containing folder named 'New folder' recursively.")
+    parser.add_argument(
+        "--batch-root", type=Path,
+        help="Recursively process leaf-most TIFF-containing folders, regardless of folder name.",
+    )
+    parser.add_argument(
+        "--folder-name",
+        help="Optional batch restriction: process only TIFF folders with this exact directory name.",
+    )
     parser.add_argument(
         "--exclude-target",
         action="append",
         default=[],
         help="Skip batch folders whose path contains this target name; may be repeated.",
     )
+    parser.add_argument(
+        "--segmentation-channel", type=int, default=Settings.segmentation_channel,
+        help="One-based channel used for object segmentation (default: 1).",
+    )
+    parser.add_argument(
+        "--channel-name", action="append", default=[], metavar="CHANNEL=NAME",
+        help="Override an output channel name, for example --channel-name 2=ProteinA. Repeatable.",
+    )
     parser.add_argument("--min-area", type=int, default=Settings.min_nucleus_area_px)
     parser.add_argument("--sigma", type=float, default=Settings.gaussian_sigma_px)
+    parser.add_argument("--no-fill-holes", action="store_true")
     parser.add_argument("--clear-border", action="store_true")
     parser.add_argument("--no-watershed", action="store_true", help="Disable separation of touching nuclei.")
     parser.add_argument(
@@ -683,24 +766,49 @@ def parse_args() -> argparse.Namespace:
         default=Settings.min_nucleus_radius_px,
         help="Minimum interior distance in pixels for a nuclear marker (default: 5).",
     )
+    parser.add_argument(
+        "--expected-count", type=int,
+        help="Optional expected total object count per target/condition for QA only.",
+    )
+    parser.add_argument(
+        "--qa-exempt-date", action="append", default=[],
+        help="Date label exempt from expected-count QA; repeatable.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
+    channel_names: dict[int, str] = {}
+    for item in args.channel_name:
+        try:
+            channel_text, name = item.split("=", 1)
+            channel = int(channel_text)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --channel-name {item!r}; use CHANNEL=NAME") from exc
+        if channel < 1 or not name.strip():
+            raise SystemExit(f"Invalid --channel-name {item!r}; use a positive channel and non-empty name")
+        channel_names[channel] = name.strip()
     if args.batch_root and args.input_folder:
         raise SystemExit("Use either --batch-root or --input-folder, not both.")
     if args.batch_root:
         settings = Settings(
+            segmentation_channel=args.segmentation_channel,
             min_nucleus_area_px=args.min_area,
             gaussian_sigma_px=args.sigma,
+            fill_holes=not args.no_fill_holes,
             clear_border=args.clear_border,
             split_touching_nuclei=not args.no_watershed,
             watershed_min_distance_px=args.watershed_min_distance,
             min_nucleus_radius_px=args.min_nucleus_radius,
         )
-        summary = analyze_batch(args.batch_root, settings, excluded_targets=set(args.exclude_target))
+        summary = analyze_batch(
+            args.batch_root, settings, excluded_targets=set(args.exclude_target),
+            folder_name=args.folder_name, channel_names=channel_names,
+            expected_count=args.expected_count,
+            qa_exempt_dates=set(args.qa_exempt_date),
+        )
         completed = sum(row["status"] == "complete" for row in summary)
         failed = sum(row["status"] == "failed" for row in summary)
         excluded = sum(row["status"] == "excluded" for row in summary)
@@ -714,15 +822,17 @@ def main() -> int:
     if min_area is None:
         return 0
     settings = Settings(
+        segmentation_channel=args.segmentation_channel,
         min_nucleus_area_px=min_area,
         gaussian_sigma_px=args.sigma,
+        fill_holes=not args.no_fill_holes,
         clear_border=args.clear_border,
         split_touching_nuclei=not args.no_watershed,
         watershed_min_distance_px=args.watershed_min_distance,
         min_nucleus_radius_px=args.min_nucleus_radius,
     )
     try:
-        workbook = analyze_folder(folder, settings)
+        workbook = analyze_folder(folder, settings, channel_names=channel_names)
     except Exception as exc:
         LOG.debug(traceback.format_exc())
         _show_message("Nuclear intensity analysis failed", str(exc), error=True)

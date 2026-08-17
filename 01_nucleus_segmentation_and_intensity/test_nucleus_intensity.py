@@ -10,6 +10,7 @@ from skimage import measure
 from nucleus_intensity import (
     Settings,
     analyze_folder,
+    find_analysis_folders,
     infer_target_names,
     filter_labels_by_area,
     load_sum_projections,
@@ -20,6 +21,23 @@ from nucleus_intensity import (
 
 
 class PipelineTests(unittest.TestCase):
+    def test_folder_discovery_does_not_require_new_folder_name(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
+            root = Path(tmp)
+            parent = root / "experiment"
+            selected = parent / "arbitrary_image_directory"
+            selected.mkdir(parents=True)
+            (parent / "parent_copy.tif").touch()
+            (selected / "image.tiff").touch()
+            output = selected / "Intensity" / "Masks"
+            output.mkdir(parents=True)
+            (output / "generated_mask.tif").touch()
+            self.assertEqual(find_analysis_folders(root), [selected.resolve()])
+            self.assertEqual(
+                find_analysis_folders(root, "arbitrary_image_directory"),
+                [selected.resolve()],
+            )
+
     def test_post_watershed_area_filter_preserves_separate_labels(self):
         labels = np.zeros((120, 220), dtype=np.uint32)
         labels[10:90, 10:90] = 1  # 6,400 px: keep.
@@ -51,7 +69,7 @@ class PipelineTests(unittest.TestCase):
         root = Path("20260730 MCF10A hypoxia normoxia")
         three_channel = root / "FBL-568 10ms NOP16-568 40ms" / "MCF10A hypoxia FBL-568 NOP61-488 DAPI Rep1" / "New folder"
         two_channel = root / "CENPB-488 50ms" / "MCF10A normoxia CENPB-488 DAPI Rep2" / "New folder"
-        self.assertEqual(infer_target_names(three_channel, 3), {2: "NOP16", 3: "FBL"})
+        self.assertEqual(infer_target_names(three_channel, 3), {2: "NOP61", 3: "FBL"})
         self.assertEqual(infer_target_names(two_channel, 2), {2: "CENPB"})
 
     def test_fill_holes_and_remove_tiny_dapi_foci(self):
